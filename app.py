@@ -6,79 +6,90 @@ import numpy as np
 import py3Dmol
 import requests
 
+# === SETTINGS ===
+RAW_DATA_URL = "https://raw.githubusercontent.com/JamesCobley/Oxiapp/main/site_redox_quant.tsv"
+
 st.set_page_config(layout="wide")
-st.title("🔬 Redox Structure Viewer")
+st.title("🔬 Oxidation Viewer via AlphaFold")
 
-# === Upload Data ===
-uploaded_file = st.file_uploader("Upload redox site file (.tsv)", type=["tsv"])
+@st.cache_data
+def load_data(url):
+    df = pd.read_csv(url, sep='\t')
+    df['Site'] = df['Site'].astype(str).str.extract(r'(\d+)').astype(float).astype(int)
+    return df
 
-if uploaded_file:
-    df = pd.read_csv(uploaded_file, sep='\t')
-    required_cols = {'Protein', 'Site', 'Sample', '%Reduced'}
-    
-    if not required_cols.issubset(df.columns):
-        st.error(f"Missing required columns. Found: {df.columns.tolist()}")
-        st.stop()
-
-    # === Preprocess ===
-    df['%Oxidized'] = 100 - df['%Reduced']
-    df['Condition'] = df['Sample'].str.extract(r'(Fresh|Store)', expand=False)
-    df = df.dropna(subset=['Protein', 'Site', '%Oxidized', 'Condition'])
-
-    # === Summarize ===
-    summary = (
-        df.groupby(['Protein', 'Site', 'Condition'])['%Oxidized']
-        .agg(['mean', 'std'])
-        .reset_index()
-        .pivot(index=['Protein', 'Site'], columns='Condition')
-        .reset_index()
-    )
-
-    # Flatten MultiIndex columns
-    summary.columns = ['Protein', 'Site', 'Fresh_mean', 'Store_mean', 'Fresh_std', 'Store_std']
-    summary['DeltaOx'] = summary['Fresh_mean'] - summary['Store_mean']
-
-    # === Select Protein ===
-    uniprot_list = sorted(summary['Protein'].unique())
-    selected_protein = st.selectbox("Select UniProt ID", uniprot_list)
-
-    protein_df = summary[summary['Protein'] == selected_protein]
-
-    # === Plot summary ===
-    st.subheader("📊 Oxidation Summary Per Site")
-    st.dataframe(protein_df[['Site', 'Fresh_mean', 'Store_mean', 'DeltaOx']].round(2))
-
-    # === AlphaFold fetch ===
-    st.subheader("🧬 AlphaFold Structure")
-    af_url = f"https://alphafold.ebi.ac.uk/files/AF-{selected_protein}-F1-model_v4.pdb"
-    r = requests.get(af_url)
-
+@st.cache_data
+def fetch_alphafold_pdb(uniprot_id):
+    url = f"https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_v4.pdb"
+    r = requests.get(url)
     if r.status_code != 200:
-        st.error("AlphaFold structure not found.")
-        st.stop()
+        return None
+    return r.text
 
-    pdb_lines = r.text
-    viewer = py3Dmol.view(width=800, height=600)
-    viewer.addModel(pdb_lines, 'pdb')
-    viewer.setStyle({'cartoon': {'color': 'white'}})
+def color_by_oxidation(pdb, site_values, color_map='redox'):
+    view = py3Dmol.view(width=800, height=600)
+    view.addModel(pdb, 'pdb')
+    view.setStyle({'cartoon': {'color': 'white'}})
 
-    # === Color by Oxidation ===
-    st.markdown("### 🎨 Color By:")
-    color_option = st.radio("Choose coloring metric:", ['Fresh_mean', 'Store_mean', 'DeltaOx'])
+    for site, value in site_values.items():
+        if value is None: continue
+        color = get_color(value)
+        view.addStyle(
+            {'resi': int(site), 'atom': 'SG'},  # Cys SG atom
+            {'stick': {'color': color, 'radius': 0.3}}
+        )
+    view.zoomTo()
+    return view
 
-    cmap = plt.get_cmap("coolwarm")
-    values = protein_df[color_option].fillna(0)
-    vmin, vmax = values.min(), values.max()
+def get_color(percent_ox):
+    if percent_ox < 20: return 'blue'
+    elif percent_ox < 40: return 'green'
+    elif percent_ox < 60: return 'yellow'
+    elif percent_ox < 80: return 'orange'
+    else: return 'red'
 
-    for _, row in protein_df.iterrows():
-        site = int(row['Site'])
-        val = row[color_option]
-        if pd.notna(val):
-            norm_val = (val - vmin) / (vmax - vmin + 1e-6)
-            r, g, b, _ = cmap(norm_val)
-            hex_color = '#%02x%02x%02x' % (int(r*255), int(g*255), int(b*255))
-            viewer.addStyle({'resi': site}, {'cartoon': {'color': hex_color}})
+# === MAIN ===
 
-    viewer.zoomTo()
-    viewer.show()
-    st.components.v1.html(viewer.render(), height=600)
+df = load_data(RAW_DATA_URL)
+
+uniprots = sorted(df['Protein'].dropna().unique())
+choice = st.selectbox("Select UniProt ID", uniprots)
+
+view_mode = st.radio("View", ['Fresh', 'Store', 'Delta'], horizontal=True)
+
+# Subset data
+subset = df[df['Protein'] == choice]
+
+# Pick relevant samples
+fresh_cols = [col for col in df.columns if 'Fresh' in col and col.endswith('%Reduced')]
+store_cols = [col for col in df.columns if 'Store' in col and col.endswith('%Reduced')]
+
+# Compute %Oxidized
+subset['Fresh_Ox'] = 100 - subset[fresh_cols].mean(axis=1)
+subset['Store_Ox'] = 100 - subset[store_cols].mean(axis=1)
+subset['Delta'] = subset['Fresh_Ox'] - subset['Store_Ox']
+
+# Choose data for coloring
+if view_mode == 'Fresh':
+    site_color_data = dict(zip(subset['Site'], subset['Fresh_Ox']))
+elif view_mode == 'Store':
+    site_color_data = dict(zip(subset['Site'], subset['Store_Ox']))
+else:
+    site_color_data = dict(zip(subset['Site'], subset['Delta']))
+
+# Fetch structure
+with st.spinner("Fetching AlphaFold structure..."):
+    pdb = fetch_alphafold_pdb(choice)
+
+if pdb:
+    view = color_by_oxidation(pdb, site_color_data)
+    view.show()
+    view.png()
+    st.pydeck_chart(view)
+else:
+    st.error("❌ AlphaFold structure not found for this UniProt ID.")
+
+# Show data table
+st.subheader("📋 Site-level Data")
+st.dataframe(subset[['Site', 'Fresh_Ox', 'Store_Ox', 'Delta']])
+
