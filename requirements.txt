@@ -5,3 +5,7 @@ matplotlib>=3.7
 py3Dmol>=2.0
 biopython>=1.81
 requests>=2.31
+scipy
+statsmodels
+openpyxl
+plotly
